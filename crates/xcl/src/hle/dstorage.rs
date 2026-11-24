@@ -869,24 +869,57 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
         return Err(E_ACCESS_VIOLATION);
     }
+    // The source and a physical destination are checked before any buffer is allocated: the
+    // sizes are the title's (up to 4 GiB each), and a request that cannot be delivered would
+    // otherwise allocate its source and BCPack staging buffers first (#1392).
+    let late: Vec<usize>;
+    let dest_pages = if r.dest_physical_pages() {
+        let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
+        // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
+        // read again now. A retail title keeps its page arrays in its own tables and fills an
+        // entry after EnqueueRequest – its streaming requests were refused by the thousand
+        // with page 0. An array that had its pages at enqueue stays as it was snapshotted
+        // (titles also pass arrays on the stack).
+        let pages = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
+            late = (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect();
+            &late[..]
+        } else {
+            pages
+        };
+        if !crate::hle::kernelx::physical_pages_live(pages, r.destination_page_offset as usize, n) {
+            return Err(E_ACCESS_VIOLATION);
+        }
+        Some(pages)
+    } else {
+        None
+    };
     let src: Vec<u8> = if r.memory_source() {
-        let mut b = vec![0u8; r.source_size as usize];
         if r.source_physical_pages() {
             let pages = src_pages.ok_or(E_ACCESS_VIOLATION)?;
+            if !crate::hle::kernelx::physical_pages_live(pages, r.source_page_offset as usize, r.source_size as usize) {
+                return Err(E_ACCESS_VIOLATION);
+            }
+            let mut b = vec![0u8; r.source_size as usize];
             if !crate::hle::kernelx::read_physical_pages(pages, r.source_page_offset as usize, &mut b) {
                 return Err(E_ACCESS_VIOLATION);
             }
+            b
         } else {
             if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
                 return Err(E_ACCESS_VIOLATION);
             }
+            let mut b = vec![0u8; r.source_size as usize];
             if !b.is_empty() {
                 std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
             }
+            b
         }
-        b
     } else {
         let f = file.and_then(|f| f.handle()).ok_or(E_FILE_HANDLE)?;
+        // a read past the end of the file fails as `read_exact_at` would, before its buffer exists
+        if f.metadata().is_ok_and(|m| r.offset.checked_add(r.source_size as u64).is_none_or(|end| end > m.len())) {
+            return Err(E_END_OF_FILE);
+        }
         let mut b = vec![0u8; r.source_size as usize];
         read_exact_at(&f, r.offset, &mut b)?;
         b
@@ -918,20 +951,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     };
     let payload = if bc != 0 { bcpack_unpack(r, &stage1, n)? } else { stage1 };
 
-    if r.dest_physical_pages() {
-        let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
-        // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
-        // read again now. A retail title keeps its page arrays in its own tables and fills an
-        // entry after EnqueueRequest – its streaming requests were refused by the thousand
-        // with page 0. An array that had its pages at enqueue stays as it was snapshotted
-        // (titles also pass arrays on the stack).
-        let late: Vec<usize>;
-        let pages = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
-            late = (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect();
-            &late[..]
-        } else {
-            pages
-        };
+    if let Some(pages) = dest_pages {
         if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
             return Err(E_ACCESS_VIOLATION);
         }
@@ -2053,6 +2073,58 @@ mod tests {
             queue_close(q);
             queue_release(q);
             status_release(s);
+        }
+    }
+
+    /// The process's peak commit charge, in bytes.
+    fn peak_commit() -> usize {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        unsafe {
+            let mut c: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+            c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            assert_ne!(K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c, c.cb), 0);
+            c.PeakPagefileUsage
+        }
+    }
+
+    /// #1392: a request whose source or physical destination cannot be used fails before its
+    /// buffers are allocated. Single-stage BC7 requests: the source size is the title's (here
+    /// 4 GiB - 1) and does not have to match the 64-byte destination.
+    #[test]
+    fn unusable_requests_fail_before_their_buffers_are_allocated() {
+        let bc7 = 7 << BCPACK_SHIFT;
+        let mut dst = vec![0u8; 64];
+        let packed = [0u8; 16];
+        unsafe {
+            // A file source of 1 byte: E_END_OF_FILE, without the 4 GiB buffer for the read.
+            let path = std::env::temp_dir().join(format!("xcl-dstorage-1392-{}.bin", std::process::id()));
+            std::fs::write(&path, [0x5A]).unwrap();
+            let file = FileInner { id: 0, path: Vec::new(), file: Mutex::new(Some(Arc::new(std::fs::File::open(&path).unwrap()))) };
+            let r = Request::parse(&request(bc7, dst.as_mut_ptr() as u64, 64, 0x1000, 0, u32::MAX));
+            assert_eq!(r.check(false), Ok(()), "the console's checks let it through");
+            let before = peak_commit();
+            assert_eq!(execute(&r, Some(&file), None, None), Err(E_END_OF_FILE), "file source past its end");
+            let grew = peak_commit() - before;
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            assert!(grew < 1 << 30, "the failed read committed {grew} bytes");
+
+            // A memory source that is not readable: E_ACCESS_VIOLATION, without a 4 GiB copy.
+            let r = Request::parse(&request(SOURCE_MEMORY_BIT | bc7, dst.as_mut_ptr() as u64, 64, packed.as_ptr() as u64, 0, u32::MAX));
+            assert_eq!(r.check(true), Ok(()), "the console's checks let it through");
+            let before = peak_commit();
+            assert_eq!(execute(&r, None, None, None), Err(E_ACCESS_VIOLATION), "unreadable memory source");
+            let grew = peak_commit() - before;
+            assert!(grew < 1 << 30, "the failed copy committed {grew} bytes");
+
+            // Physical destination pages that are no live allocation (64 MiB of them): refused
+            // before BCPack decodes into staging buffers of the destination's size, so the error
+            // is the destination's, not E_DECOMPRESSION from the 16-byte stream.
+            let n = 64u32 << 20;
+            let pages = vec![0x7777usize; n as usize / crate::hle::kernelx::PHYS_PAGE_SIZE];
+            let r = Request::parse(&request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT | bc7, pages.as_ptr() as u64, 0, n, packed.as_ptr() as u64, 0, 16, 0, 0));
+            assert_eq!(r.check(true), Ok(()), "the console's checks let it through");
+            assert_eq!(execute(&r, None, Some(&pages), None), Err(E_ACCESS_VIOLATION), "dead destination pages");
         }
     }
 

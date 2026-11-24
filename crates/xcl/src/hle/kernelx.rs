@@ -884,6 +884,17 @@ unsafe fn resolve_physical_pages(away: Option<&Away>, pages: &[usize], offset: u
     Some(addrs)
 }
 
+/// Whether `pages` covers `offset..offset+len` with pages of live allocations: what
+/// `read_physical_pages` and `write_physical_pages` check, without committing or copying
+/// anything (a caller can refuse a request before it allocates buffers for it).
+pub fn physical_pages_live(pages: &[usize], offset: usize, len: usize) -> bool {
+    if offset >= PHYS_PAGE {
+        return false;
+    }
+    let Some(need) = offset.checked_add(len).map(|span| span.div_ceil(PHYS_PAGE)) else { return false };
+    pages.len() >= need && pages[..need].iter().all(|&p| page_home(p).is_some())
+}
+
 /// Copy `dst.len()` bytes starting at `offset` within `pages` (each a 64 KiB physical page
 /// number from `AllocateTitlePhysicalPages`). Returns `false` if `offset >= PHYS_PAGE_SIZE`,
 /// `pages` is too short, or any page is not a live allocation.
