@@ -6286,6 +6286,142 @@ fn f32_compares_with_nan(wave64: bool) {
     assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
 }
 
+/// Every integer compare (i32, u32, i16, u16, i64, u64; RDNA2 has no f / t of the 16-bit
+/// ones) as v_cmp in VOP3 (an SGPR pair) and VOPC (VCC), and as v_cmpx in VOPC and VOP3
+/// (EXEC only: VCC keeps its value), against a reference on the operands sign- or
+/// zero-extended to i128. The pairs: every pair of the signed and unsigned extremes of the
+/// width, and random ones, a quarter of them equal. 16-bit sources hold junk in their high
+/// halves. Some lanes are off in EXEC and must give 0 bits. Wave32 writes 32-bit masks: the
+/// high SGPR of a VOP3 destination and VCC_HI keep their values. As a wave64 program
+/// (natively or in the split form) and as wave32.
+#[test]
+fn gpu_integer_compares() {
+    if !gpu_ready() {
+        return;
+    }
+    for wave64 in [true, false] {
+        integer_compares(wave64);
+    }
+}
+
+fn integer_compares(wave64: bool) {
+    const OPS: [&str; 8] = ["F", "LT", "EQ", "LE", "GT", "NE", "GE", "T"];
+    let want_of = |op: &str, a: i128, b: i128| match op {
+        "F" => false, "LT" => a < b, "EQ" => a == b, "LE" => a <= b, "GT" => a > b, "NE" => a != b, "GE" => a >= b, _ => true,
+    };
+    let (n, all) = if wave64 { (64, u64::MAX) } else { (32, u32::MAX as u64) };
+    let seed = |s: usize| 0xC0DE_0000 | s as u32;
+    let mut rng = Rng(0x0BAD_C0DE_1234_5678);
+    let mut bad = Vec::new();
+    for (ty, bits, signed) in [("I32", 32, true), ("U32", 32, false), ("I16", 16, true), ("U16", 16, false), ("I64", 64, true), ("U64", 64, false)] {
+        let ops: Vec<&str> = OPS.iter().copied().filter(|o| bits != 16 || !matches!(*o, "F" | "T")).collect();
+        let k = ops.len() as u64;
+        let ext = |x: u64| -> i128 {
+            let x = if bits == 64 { x } else { x & ((1u64 << bits) - 1) };
+            if signed && x >> (bits - 1) & 1 == 1 { x as i128 - (1i128 << bits) } else { x as i128 }
+        };
+        // a in v0 / v[2:3], b in v1 / v[4:5]; results: VOP3 s[20..], VCC to s[36..], v_cmpx
+        // EXEC to s[52..] (VOPC) and s[68..] (VOP3); s[2:3] is the EXEC every compare starts with.
+        // The VOP3 destinations start as copies of s[84..]: a wave32 compare leaves their high
+        // word. VCC is s[100:101] while the v_cmpx run.
+        let (s0, s1) = if bits == 64 { (2u64, 4u64) } else { (0, 1) };
+        let names: Vec<(String, String)> = ops.iter().map(|o| (format!("V_CMP_{o}_{ty}"), format!("V_CMPX_{o}_{ty}"))).collect();
+        let f3: Vec<[(&str, u64); 3]> = (0..k).map(|i| [("VDST", 20 + 2 * i), ("SRC0", V + s0), ("SRC1", V + s1)]).collect();
+        let fx3 = [("VDST", 126), ("SRC0", V + s0), ("SRC1", V + s1)];
+        let fc = [("SRC0", V + s0), ("VSRC1", s1)];
+        let mov: Vec<[(&str, u64); 2]> =
+            (0..k).flat_map(|i| [[("SDST", 36 + 2 * i), ("SSRC0", 106)], [("SDST", 52 + 2 * i), ("SSRC0", 126)], [("SDST", 68 + 2 * i), ("SSRC0", 126)]]).collect();
+        let restore = [("SDST", 126), ("SSRC0", 2)];
+        let pre: Vec<[(&str, u64); 2]> = (0..k).map(|i| [("SDST", 20 + 2 * i), ("SSRC0", 84 + 2 * i)]).collect();
+        let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = Vec::new();
+        for i in 0..ops.len() {
+            list.push(("S_MOV_B64", "ENC_SOP1", &pre[i][..], None));
+            list.push((names[i].0.as_str(), "ENC_VOP3", &f3[i][..], None));
+        }
+        for i in 0..ops.len() {
+            list.push((names[i].0.as_str(), "ENC_VOPC", &fc[..], None));
+            list.push(("S_MOV_B64", "ENC_SOP1", &mov[3 * i][..], None));
+        }
+        list.push(("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 100)], None));
+        for i in 0..ops.len() {
+            list.push((names[i].1.as_str(), "ENC_VOPC", &fc[..], None));
+            list.push(("S_MOV_B64", "ENC_SOP1", &mov[3 * i + 1][..], None));
+            list.push(("S_MOV_B64", "ENC_SOP1", &restore[..], None));
+            list.push((names[i].1.as_str(), "ENC_VOP3", &fx3[..], None));
+            list.push(("S_MOV_B64", "ENC_SOP1", &mov[3 * i + 2][..], None));
+            list.push(("S_MOV_B64", "ENC_SOP1", &restore[..], None));
+        }
+        let p = prog(&list);
+        let o = Options { wave64, ..Default::default() };
+        let t = translate(&p, &if wave64 { on_gpu(o) } else { o }).unwrap();
+        assert!(t.complete(), "{ty}: {:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+
+        let vals: &[u64] = match bits {
+            16 => &[0, 1, 0x7FFE, 0x7FFF, 0x8000, 0x8001, 0xFFFF],
+            32 => &[0, 1, 0x7FFF_FFFE, 0x7FFF_FFFF, 0x8000_0000, 0x8000_0001, 0xFFFF_FFFF],
+            _ => &[0, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF, 0x1_0000_0000, 0x7FFF_FFFF_FFFF_FFFF, 0x8000_0000_0000_0000,
+                0x8000_0000_FFFF_FFFF, 0xFFFF_FFFF_0000_0000, 0xFFFF_FFFF_8000_0000, u64::MAX],
+        };
+        // junk above a 16-bit operand: the compare reads only the low half
+        let junk = |rng: &mut Rng| if bits == 16 { rng.next() & 0xFFFF_0000 } else { 0 };
+        let mut pairs: Vec<(u64, u64)> = Vec::new();
+        for &a in vals {
+            for &b in vals {
+                pairs.push((a | junk(&mut rng), b | junk(&mut rng)));
+            }
+        }
+        for _ in 0..96 {
+            let a = rng.next();
+            let b = if rng.below(4) == 0 { if bits == 16 { a & 0xFFFF | junk(&mut rng) } else { a } } else { rng.next() };
+            pairs.push((a, b));
+        }
+        let mut next = 0usize;
+        let mut d = 0u32;
+        while next < pairs.len() {
+            let exec = (0xF7FB_FFDEu32.rotate_left(5 * d) as u64 | (0x7FFF_BFFEu32.rotate_left(3 * d) as u64) << 32) & all;
+            d += 1;
+            let mut st = KernelState::default();
+            (st.sgpr[126], st.sgpr[127], st.sgpr[2], st.sgpr[3]) = (exec as u32, (exec >> 32) as u32, exec as u32, (exec >> 32) as u32);
+            for s in (84..102).chain([107]) {
+                st.sgpr[s] = seed(s);
+            }
+            let mut ab = Vec::new();
+            for (l, r) in st.vgpr.iter_mut().enumerate().take(n) {
+                let (a, b) = if exec >> l & 1 == 1 && next < pairs.len() {
+                    next += 1;
+                    pairs[next - 1]
+                } else {
+                    (rng.next(), rng.next())
+                };
+                (r[0], r[1], r[2], r[3], r[4], r[5]) = (a as u32, b as u32, a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32);
+                ab.push((a, b));
+            }
+            let r = runner::run(&dxil, &st, &[]).unwrap();
+            let pair = |s: usize| r.sgpr[s] as u64 | (r.sgpr[s + 1] as u64) << 32;
+            for (i, op) in ops.iter().enumerate() {
+                let want = ab.iter().enumerate().fold(0u64, |m, (l, &(a, b))| m | ((exec >> l & 1 == 1 && want_of(op, ext(a), ext(b))) as u64) << l);
+                for (enc, s) in [("v_cmp VOP3", 20 + 2 * i), ("v_cmp VOPC", 36 + 2 * i), ("v_cmpx VOPC", 52 + 2 * i), ("v_cmpx VOP3", 68 + 2 * i)] {
+                    let got = pair(s) & all;
+                    for l in (0..n).filter(|&l| (got ^ want) >> l & 1 == 1) {
+                        let (a, b) = ab[l];
+                        bad.push(format!("{enc} {op}_{ty}({a:#x}, {b:#x}) lane {l} (exec {}) = {}", exec >> l & 1, got >> l & 1));
+                    }
+                }
+                if !wave64 && (r.sgpr[21 + 2 * i], r.sgpr[37 + 2 * i]) != (seed(85 + 2 * i), seed(107)) {
+                    bad.push(format!("{op}_{ty}: wave32 wrote the high word, VOP3 {:#x}, VOPC (vcc_hi) {:#x}", r.sgpr[21 + 2 * i], r.sgpr[37 + 2 * i]));
+                }
+            }
+            if (r.sgpr[106], r.sgpr[107]) != (seed(100), seed(101)) {
+                bad.push(format!("{ty}: v_cmpx wrote vcc = {:#x}", pair(106)));
+            }
+        }
+    }
+    bad.sort();
+    bad.dedup();
+    assert!(bad.is_empty(), "wave{n}: {} failures\n{}", bad.len(), bad.iter().take(40).cloned().collect::<Vec<_>>().join("\n"));
+}
+
 /// xorshift64, the fixed-seed generator of the randomized GPU tests
 struct Rng(u64);
 impl Rng {
