@@ -23,6 +23,8 @@ const TICK: Duration = Duration::from_millis(4);
 
 struct Batch {
     dead: Vec<usize>,
+    /// blocks of unified memory under `dead` (a heap's): freed after `dead` is released
+    blocks: Vec<usize>,
     /// (fence, value) a queue: all reached = nothing submitted before the batch closed is left
     marks: Vec<(ID3D12Fence, u64)>,
 }
@@ -32,6 +34,7 @@ struct Held {
     /// queue → its fence here and the last value signalled on it
     fences: HashMap<usize, (ID3D12Fence, u64)>,
     open: Vec<usize>,
+    open_blocks: Vec<usize>,
     sealed: VecDeque<Batch>,
     last_seal: Option<Instant>,
 }
@@ -45,8 +48,9 @@ impl Held {
     }
 
     /// Close the open batch (at most every `SEAL_EVERY`, or `seal_now`) with a fence value on each of `queues`,
-    /// and take out the batches every queue is past: the resources to release now.
-    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<usize> {
+    /// and take out the batches every queue is past: the resources to release now, and the
+    /// blocks of unified memory to free after them.
+    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> (Vec<usize>, Vec<usize>) {
         if !self.open.is_empty() && (seal_now || self.last_seal.is_none_or(|t| t.elapsed() >= SEAL_EVERY)) {
             let mut marks = Vec::with_capacity(queues.len());
             let mut ok = true;
@@ -73,14 +77,17 @@ impl Held {
             if ok {
                 self.last_seal = Some(Instant::now());
                 let dead = std::mem::take(&mut self.open);
-                self.sealed.push_back(Batch { dead, marks });
+                let blocks = std::mem::take(&mut self.open_blocks);
+                self.sealed.push_back(Batch { dead, blocks, marks });
             }
         }
-        let mut gone = Vec::new();
+        let (mut gone, mut blocks) = (Vec::new(), Vec::new());
         while self.sealed.front().is_some_and(|b| b.marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v)) {
-            gone.extend(self.sealed.pop_front().unwrap().dead);
+            let b = self.sealed.pop_front().unwrap();
+            gone.extend(b.dead);
+            blocks.extend(b.blocks);
         }
-        gone
+        (gone, blocks)
     }
 }
 
@@ -100,7 +107,18 @@ const IDLE_WAIT: Duration = Duration::from_micros(300);
 /// frees the memory under a resource right after its last `Release` finds it unpinned, as
 /// before. Otherwise the thread here lets it go.
 pub unsafe fn hold(res: usize) {
-    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
+    hold_with_block(res, None);
+}
+
+/// `hold` for a heap whose `block` of unified memory goes with it: the block is freed after the
+/// heap's last reference, once the queues are past the work submitted before (#1394).
+pub unsafe fn hold_with_block(res: usize, block: Option<usize>) {
+    {
+        let mut g = HELD.lock().unwrap();
+        let h = g.get_or_insert_with(Held::default);
+        h.open.push(res);
+        h.open_blocks.extend(block);
+    }
     let start = Instant::now();
     drain_known(true);
     while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
@@ -137,7 +155,7 @@ pub unsafe fn drain_known(seal_now: bool) {
     }
     queues.extend(super::sparse::queue());
     queues.extend(super::title_textures::upload_queues());
-    let gone = match HELD.lock().unwrap().as_mut() {
+    let (gone, blocks) = match HELD.lock().unwrap().as_mut() {
         Some(h) => h.drain(&queues, seal_now),
         None => return,
     };
@@ -145,6 +163,9 @@ pub unsafe fn drain_known(seal_now: bool) {
     for res in gone {
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
         f(res as *mut c_void);
+    }
+    for p in blocks {
+        super::real::free_uma_block(p);
     }
 }
 
@@ -182,9 +203,9 @@ mod tests {
             let mut held = Held::default();
             held.open.push(raw);
             let queues = [queue.clone()];
-            assert!(held.drain(&queues, false).is_empty(), "the queue has not passed the batch's fence value");
+            assert!(held.drain(&queues, false).0.is_empty(), "the queue has not passed the batch's fence value");
             std::thread::sleep(Duration::from_millis(100));
-            assert!(held.drain(&queues, false).is_empty(), "still in flight: still held");
+            assert!(held.drain(&queues, false).0.is_empty(), "still in flight: still held");
             assert!(!held.is_empty());
 
             gate.Signal(1).unwrap();
@@ -192,11 +213,49 @@ mod tests {
             let mut gone = Vec::new();
             while gone.is_empty() && start.elapsed() < Duration::from_secs(10) {
                 std::thread::sleep(Duration::from_millis(5));
-                gone = held.drain(&queues, false);
+                gone = held.drain(&queues, false).0;
             }
             assert_eq!(gone, vec![raw], "released once the queue is past the batch");
             assert!(held.is_empty());
             drop(ID3D12Resource::from_raw(raw as *mut c_void));
+        }
+    }
+
+    /// A heap's block of unified memory is held with the heap (#1394): it comes out with the
+    /// heap, once the queue is past the work submitted before, and not while the queue waits.
+    #[test]
+    fn a_held_heaps_block_goes_with_it_when_the_queue_is_past() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            let mut heap: Option<ID3D12Heap> = None;
+            let desc = D3D12_HEAP_DESC { SizeInBytes: 0x1_0000, Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, ..Default::default() };
+            dev.CreateHeap(&desc, &mut heap).unwrap();
+            let raw = heap.unwrap().into_raw() as usize;
+            let block = 0x7_0000_0000usize;
+
+            let mut held = Held::default();
+            held.open.push(raw);
+            held.open_blocks.extend(Some(block));
+            let queues = [queue.clone()];
+            assert_eq!(held.drain(&queues, false), (Vec::new(), Vec::new()), "the queue has not passed the batch's fence value");
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(held.drain(&queues, false), (Vec::new(), Vec::new()), "still in flight: heap and block held");
+
+            gate.Signal(1).unwrap();
+            let start = Instant::now();
+            let mut gone = (Vec::new(), Vec::new());
+            while gone.0.is_empty() && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(5));
+                gone = held.drain(&queues, false);
+            }
+            assert_eq!(gone, (vec![raw], vec![block]), "heap and block go together once the queue is past");
+            assert!(held.is_empty());
+            drop(ID3D12Heap::from_raw(raw as *mut c_void));
         }
     }
 
@@ -205,7 +264,7 @@ mod tests {
     fn without_queues_a_batch_goes_at_once() {
         let mut held = Held::default();
         held.open.push(0x1000);
-        assert_eq!(unsafe { held.drain(&[], false) }, vec![0x1000]);
+        assert_eq!(unsafe { held.drain(&[], false) }, (vec![0x1000], Vec::new()));
         assert!(held.is_empty());
     }
 }

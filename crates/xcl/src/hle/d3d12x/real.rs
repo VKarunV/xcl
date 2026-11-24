@@ -3087,18 +3087,38 @@ fn heap_block(heap: usize) -> Option<(usize, bool)> {
 /// ID3D12Heap::Release: its block of unified memory goes with it.
 unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    // The last reference and the heap's block are kept until the queues are past the work in
+    // flight, as a resource's last reference is (`res_release`): buffers placed in the block are
+    // held there, and the block freed under them was zeroed and handed out again while the GPU
+    // could still use it (#1394).
+    if super::late_release::enabled() {
+        let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+        if add(this) == 2 {
+            f(this);
+            let block = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
+            super::late_release::hold_with_block(this as usize, block);
+            return 0;
+        }
+        f(this);
+    }
     let n = f(this);
     if n == 0 {
-        let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
-        if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
-            if u.is_sparse(p) {
-                super::sparse::free(p);
-            } else {
-                u.free(p);
-            }
+        if let Some(p) = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block) {
+            free_uma_block(p);
         }
     }
     n
+}
+
+/// Give a block of unified memory back (sparse VRAM or the coherent window).
+pub(super) unsafe fn free_uma_block(p: usize) {
+    if let Some(u) = crate::gpu::uma::get() {
+        if u.is_sparse(p) {
+            super::sparse::free(p);
+        } else {
+            u.free(p);
+        }
+    }
 }
 creator!(dev_create_fence_pc, "CreateFence", Kind::Fence, [a1, a2]);
 
