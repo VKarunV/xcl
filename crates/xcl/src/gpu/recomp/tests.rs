@@ -1201,6 +1201,104 @@ fn gpu_scalar_loop_and_scc() {
     assert_eq!((r.sgpr[41], r.sgpr[42], r.sgpr[43]), (48, 33, u32::MAX), "flbit_i64 high-then-low scan");
 }
 
+/// The ISA's SCC for `s_cmp_<rel>_<ty>` (SOPC: S0 against S1) and `s_cmpk_<rel>_<ty>` (SOPK:
+/// SDST against SIMM16, sign-extended for _I32 and zero-extended for _U32).
+fn scalar_compare_reference(op: &str, a: u32, b: u32) -> bool {
+    let (k, rest) = match op.strip_prefix("S_CMPK_") {
+        Some(rest) => (true, rest),
+        None => (false, op.strip_prefix("S_CMP_").unwrap()),
+    };
+    let (rel, ty) = rest.split_once('_').unwrap();
+    let ord = match (ty, k) {
+        ("I32", false) => (a as i32).cmp(&(b as i32)),
+        ("I32", true) => (a as i32).cmp(&(b as u16 as i16 as i32)),
+        ("U32", false) => a.cmp(&b),
+        ("U32", true) => a.cmp(&(b as u16 as u32)),
+        _ => panic!("no reference for {op}"),
+    };
+    match rel {
+        "EQ" => ord.is_eq(),
+        "LG" => ord.is_ne(),
+        "GT" => ord.is_gt(),
+        "GE" => ord.is_ge(),
+        "LT" => ord.is_lt(),
+        "LE" => ord.is_le(),
+        _ => panic!("no reference for {op}"),
+    }
+}
+
+/// Every 32-bit scalar compare, SOPC and SOPK, on sign boundaries, equal values, zero and
+/// all-ones, compared with `scalar_compare_reference`. Each case starts with SCC set to the
+/// opposite of the expected result, so a compare that leaves SCC alone fails; the SOPK cases also
+/// check that SDST (their first operand) keeps its value.
+#[test]
+fn gpu_scalar_compares_sopc_and_sopk() {
+    if !gpu_ready() {
+        return;
+    }
+    let sopc_pairs: [(u32, u32); 10] = [
+        (0, 0),
+        (5, 5),
+        (1, 2),
+        (2, 1),
+        (0x7FFF_FFFF, 0x8000_0000), // signed: max > min, unsigned: below
+        (0x8000_0000, 0x7FFF_FFFF),
+        (0xFFFF_FFFF, 0), // signed: -1 < 0, unsigned: max > 0
+        (0, 0xFFFF_FFFF),
+        (0xFFFF_FFFF, 0xFFFF_FFFF),
+        (0x8000_0000, 0x8000_0000),
+    ];
+    // (SDST, SIMM16): the sign- and zero-extended SIMM16 order differently against SDST
+    let sopk_pairs: [(u32, u32); 10] = [
+        (0, 0),
+        (0xFFFF_8000, 0x8000), // _I32: -32768 == -32768, _U32: above 0x8000
+        (0x0000_8000, 0x8000), // _I32: 32768 > -32768, _U32: equal
+        (0xFFFF_FFFF, 0xFFFF), // _I32: -1 == -1, _U32: above 0xFFFF
+        (0x0000_FFFF, 0xFFFF), // _I32: 65535 > -1, _U32: equal
+        (0x0000_FFFE, 0xFFFF), // _I32: 65534 > -1, _U32: below
+        (0x0000_7FFF, 0x7FFF),
+        (0x8000_0000, 0x7FFF),
+        (0x7FFF_FFFF, 0x8000),
+        (0x0001_0000, 0), // SDST is compared whole, not as its low 16 bits
+    ];
+    let mut cases = Vec::new();
+    for rel in ["EQ", "LG", "GT", "GE", "LT", "LE"] {
+        for ty in ["I32", "U32"] {
+            cases.extend(sopc_pairs.iter().map(|&(a, b)| (format!("S_CMP_{rel}_{ty}"), "ENC_SOPC", a, b)));
+            cases.extend(sopk_pairs.iter().map(|&(a, b)| (format!("S_CMPK_{rel}_{ty}"), "ENC_SOPK", a, b)));
+        }
+    }
+    let mov = |r: u64, v: u32| ins("S_MOV_B32", "ENC_SOP1", &[("SDST", r), ("SSRC0", 255)], Some(v));
+    // 50 cases per program: s[4 + 2i] = SCC after, s[5 + 2i] = S0 / SDST after (below VCC)
+    for chunk in cases.chunks(50) {
+        let mut parts = Vec::new();
+        for (i, (op, enc, a, b)) in chunk.iter().enumerate() {
+            let o = 4 + 2 * i as u64;
+            parts.push(mov(0, *a));
+            parts.push(mov(1, *b));
+            // SCC before = !expected: 0 == 1 or 0 == 0
+            let want = scalar_compare_reference(op, *a, *b);
+            parts.push(ins("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", if want { 129 } else { 128 })], None));
+            parts.push(match *enc {
+                "ENC_SOPK" => ins(op, enc, &[("SDST", 0), ("SIMM16", *b as u64 & 0xFFFF)], None),
+                _ => ins(op, enc, &[("SSRC0", 0), ("SSRC1", 1)], None),
+            });
+            parts.push(ins("S_CSELECT_B32", "ENC_SOP2", &[("SDST", o), ("SSRC0", 129), ("SSRC1", 128)], None));
+            parts.push(ins("S_MOV_B32", "ENC_SOP1", &[("SDST", o + 1), ("SSRC0", 0)], None));
+        }
+        let r = runner::run_code(&program_of(&parts), &KernelState::default(), &[]).unwrap();
+        let mut bad = Vec::new();
+        for (i, (op, _, a, b)) in chunk.iter().enumerate() {
+            let o = 4 + 2 * i;
+            let want = scalar_compare_reference(op, *a, *b) as u32;
+            if (r.sgpr[o], r.sgpr[o + 1]) != (want, *a) {
+                bad.push(format!("{op} {a:#x}, {b:#x}: got scc={} s0={:#x}, want scc={want} s0={a:#x}", r.sgpr[o], r.sgpr[o + 1]));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+}
+
 #[test]
 fn gpu_divergence_through_exec() {
     if !gpu_ready() {
